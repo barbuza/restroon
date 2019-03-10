@@ -1,0 +1,15 @@
+roon {
+    # ip = "<PUT YOUR ROON IP HERE>"
+    port = 9100
+    # token = "<PUT YOUR ROON TOKEN HERE>"
+}
+
+rest {
+    ip = "0.0.0.0"
+    port = 9988
+}
+
+logging {
+    level = "info"
+    formatter = "text"
+}
