@@ -59,6 +59,7 @@ func main() {
 	if registerResponse.Token != roonlib.Cfg.Roon.Token {
 		logrus.Warnf("new token %s authenticated", registerResponse.Token)
 	}
+	logrus.Infof("connected to core %s %s %s", registerResponse.CoreID, registerResponse.DisplayName, registerResponse.DisplayVersion)
 
 	go ws.ZoneStatusReducer()
 	go ws.ZonesSubscribe()

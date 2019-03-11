@@ -195,23 +195,33 @@ func parseMessage(data []byte, length int) map[string]string {
 
 const maxDatagramSize = 65535
 
-func multicastListen(ready chan<- *net.UDPConn, messages chan<- *soodMessage) {
-	addr, err := net.ResolveUDPAddr("udp", "239.255.90.90:9003")
-	if err != nil {
-		panic(err)
+func multicastListen(ready chan<- *net.UDPConn, messages chan<- *soodMessage) error {
+	ifaces, _ := net.Interfaces()
+	var targetIface *net.Interface
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
+			targetIface = &iface
+			break
+		}
 	}
-	socket, err := net.ListenMulticastUDP("udp", nil, addr)
+
+	addr, err := net.ResolveUDPAddr("udp", "239.255.90.90:9002")
 	if err != nil {
-		panic(err)
+		return err
+	}
+	socket, err := net.ListenMulticastUDP("udp", targetIface, addr)
+	if err != nil {
+		return err
 	}
 	defer socket.Close()
 	socket.SetReadBuffer(maxDatagramSize)
 	ready <- socket
 	for {
 		data := make([]byte, maxDatagramSize)
+		socket.SetReadDeadline(time.Now().Add(time.Millisecond * 500))
 		length, addr, err := socket.ReadFromUDP(data)
 		if err != nil {
-			panic(err)
+			continue
 		}
 		fields := parseMessage(data, length)
 		if fields != nil {
@@ -261,22 +271,27 @@ func (query *soodQuery) write(out io.Writer) {
 	query.writeName(out, query.uuid)
 }
 
-func multicastClient(c *net.UDPConn) {
+func multicastClient(c *net.UDPConn) error {
 	roonAddr, err := net.ResolveUDPAddr("udp", "239.255.90.90:9003")
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	query := newSoodQuery()
-	buffer := bytes.NewBuffer([]byte{})
-	query.write(buffer)
+	for {
+		query := newSoodQuery()
+		buffer := bytes.NewBuffer([]byte{})
+		query.write(buffer)
 
-	written, err := c.WriteToUDP(buffer.Bytes(), roonAddr)
-	if err != nil {
-		panic(err)
-	}
-	if written != buffer.Len() {
-		panic(fmt.Errorf("only written %d of %d", written, buffer.Len()))
+		written, err := c.WriteToUDP(buffer.Bytes(), roonAddr)
+		if err != nil {
+			return err
+		}
+		if written != buffer.Len() {
+			return fmt.Errorf("only written %d of %d", written, buffer.Len())
+		}
+		logrus.Debug("broadcast sent")
+
+		time.Sleep(time.Second)
 	}
 }
 
@@ -431,6 +446,23 @@ func (ws *wsClient) subscribe(sub subType, extra map[string]interface{}, into in
 	return nil
 }
 
+type boxBool struct {
+	mutex *sync.RWMutex
+	value bool
+}
+
+func (box *boxBool) Read() bool {
+	box.mutex.RLock()
+	defer box.mutex.RUnlock()
+	return box.value
+}
+
+func (box *boxBool) Write(val bool) {
+	box.mutex.Lock()
+	defer box.mutex.Unlock()
+	box.value = val
+}
+
 func FindRoon() (net.IP, int64) {
 	if len(Cfg.Roon.IP) > 0 && Cfg.Roon.Port > 0 {
 		return net.ParseIP(Cfg.Roon.IP), Cfg.Roon.Port
@@ -439,16 +471,36 @@ func FindRoon() (net.IP, int64) {
 	logrus.Debug("looking for roon server")
 	ready := make(chan *net.UDPConn)
 	messages := make(chan *soodMessage)
-	go multicastListen(ready, messages)
+
+	panicOnError := &boxBool{
+		mutex: &sync.RWMutex{},
+		value: false,
+	}
+
 	go func() {
-		addr := <-ready
-		for {
-			multicastClient(addr)
-			time.Sleep(time.Second * 5)
+		err := multicastListen(ready, messages)
+		if err != nil && panicOnError.Read() {
+			panic(err)
+		} else {
+			logrus.Debug("stopping broadcast server")
 		}
 	}()
+
+	addr := <-ready
+	close(ready)
+
+	go func() {
+		err := multicastClient(addr)
+		if err != nil && panicOnError.Read() {
+			panic(err)
+		} else {
+			logrus.Debug("stopping broadcast client")
+		}
+	}()
+
 	knownServers := make(map[string]bool)
 	for msg := range messages {
+		logrus.Debugf("discovery message %+v", msg)
 		serverID := msg.Fields["unique_id"]
 		_, found := knownServers[serverID]
 		if !found {
@@ -457,7 +509,12 @@ func FindRoon() (net.IP, int64) {
 			if err != nil {
 				panic(err)
 			}
-			return msg.From.IP, port
+			if len(Cfg.Roon.CoreID) == 0 || Cfg.Roon.CoreID == serverID {
+				addr.Close()
+				return msg.From.IP, port
+			} else {
+				logrus.Warnf("ignoring roon on %s:%d", msg.From.IP.String(), port)
+			}
 		}
 	}
 	panic("cant find roon")
@@ -477,20 +534,29 @@ type zoneStatus struct {
 func (ws *wsClient) ZoneStatusReducer() {
 	status := make(map[string]*zoneStatus)
 	for ev := range ws.Events.On(SubTypeZones.Key()) {
-		changedZones := []string{}
 		change := ev.Args[0].(*ZonesChangedT)
+		changedZones := []string{}
 
-		if change.Zones != nil {
+		if change.Zones != nil && len(change.Zones) > 0 {
 			status = make(map[string]*zoneStatus)
 			for _, zoneChange := range change.Zones {
-				vol := zoneChange.Outputs[0].Volume
 
 				zoneSt := &zoneStatus{
 					Name:      zoneChange.Name,
 					State:     zoneChange.State,
 					OutputID:  zoneChange.Outputs[0].ID,
-					Volume:    float64(vol.Value) / float64(vol.HardLimitMax),
-					MaxVolume: vol.HardLimitMax,
+					Volume:    0,
+					MaxVolume: 0,
+				}
+
+				vol := zoneChange.Outputs[0].Volume
+				if vol != nil {
+					if vol.HardLimitMax == 0 {
+						zoneSt.Volume = 0
+					} else {
+						zoneSt.Volume = float64(vol.Value) / float64(vol.HardLimitMax)
+					}
+					zoneSt.MaxVolume = vol.HardLimitMax
 				}
 
 				if zoneChange.NowPlaying != nil {
@@ -506,7 +572,7 @@ func (ws *wsClient) ZoneStatusReducer() {
 			}
 		}
 
-		if change.Seek != nil {
+		if change.Seek != nil && len(change.Seek) > 0 {
 			for _, zoneSeek := range change.Seek {
 				zoneStatus, found := status[zoneSeek.ID]
 				if found {
@@ -518,8 +584,10 @@ func (ws *wsClient) ZoneStatusReducer() {
 			}
 		}
 
-		ws.mutex.Lock()
-		ws.zoneStatus = status
-		ws.mutex.Unlock()
+		if len(changedZones) > 0 {
+			ws.mutex.Lock()
+			ws.zoneStatus = status
+			ws.mutex.Unlock()
+		}
 	}
 }

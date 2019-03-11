@@ -13,10 +13,11 @@ type roonConfig struct {
 	}
 
 	Roon struct {
-		IP    string
-		Port  int64
-		Zones []string
-		Token string
+		IP     string
+		Port   int64
+		Zones  []string
+		Token  string
+		CoreID string
 	}
 
 	Rest struct {
